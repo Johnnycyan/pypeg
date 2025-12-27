@@ -1,0 +1,120 @@
+name: Build and Publish Docker Images
+
+on:
+  schedule:
+    # Run every Sunday at midnight UTC
+    - cron: '0 0 * * 0'
+  workflow_dispatch: # Allow manual triggering
+  push:
+    branches:
+      - main
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  check-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.get-versions.outputs.versions }}
+    steps:
+      - name: Get latest Python versions
+        id: get-versions
+        run: |
+          # Fetch all Python slim tags from Docker Hub
+          # Filter for major.minor-slim format, exclude rc/alpha/beta
+          TAGS=$(curl -s "https://registry.hub.docker.com/v2/repositories/library/python/tags?page_size=100" | \
+            jq -r '.results[].name' | \
+            grep -E '^[0-9]+\.[0-9]+-slim$' | \
+            sed 's/-slim//' | \
+            sort -V -u | \
+            tail -3)
+          
+          # Convert to JSON array
+          VERSIONS=$(echo "$TAGS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "versions=$VERSIONS" >> $GITHUB_OUTPUT
+          echo "Found Python versions: $VERSIONS"
+
+  build-and-push:
+    needs: check-versions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        python-version: ${{ fromJson(needs.check-versions.outputs.versions) }}
+      fail-fast: false
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ matrix.python-version }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            PYTHON_VERSION=${{ matrix.python-version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify image
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.python-version }}
+          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.python-version }} python --version
+          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.python-version }} ffmpeg -version | head -1
+
+  update-latest:
+    needs: [check-versions, build-and-push]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get highest version
+        id: highest
+        run: |
+          VERSIONS='${{ needs.check-versions.outputs.versions }}'
+          HIGHEST=$(echo "$VERSIONS" | jq -r '.[-1]')
+          echo "version=$HIGHEST" >> $GITHUB_OUTPUT
+          echo "Highest version: $HIGHEST"
+
+      - name: Tag latest
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.highest.outputs.version }}
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.highest.outputs.version }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
