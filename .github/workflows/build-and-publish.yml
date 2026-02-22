@@ -21,10 +21,11 @@ jobs:
       - name: Get latest Python versions
         id: get-versions
         run: |
-          # Fetch all Python slim tags from Docker Hub
+          # Fetch all Python slim tags from Docker Hub across the first 3 pages
           # Filter for major.minor-slim format, exclude rc/alpha/beta
-          TAGS=$(curl -s "https://registry.hub.docker.com/v2/repositories/library/python/tags?page_size=100" | \
-            jq -r '.results[].name' | \
+          TAGS=$(for page in 1 2 3; do
+            curl -s "https://registry.hub.docker.com/v2/repositories/library/python/tags?page_size=100&page=$page" | jq -r '.results[].name'
+          done | \
             grep -E '^[0-9]+\.[0-9]+-slim$' | \
             sed 's/-slim//' | \
             sort -V -u | \
@@ -119,3 +120,4 @@ jobs:
           docker pull ${{ env.REGISTRY }}/$IMAGE_NAME:${{ steps.highest.outputs.version }}
           docker tag ${{ env.REGISTRY }}/$IMAGE_NAME:${{ steps.highest.outputs.version }} ${{ env.REGISTRY }}/$IMAGE_NAME:latest
           docker push ${{ env.REGISTRY }}/$IMAGE_NAME:latest
+          
